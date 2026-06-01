@@ -1,0 +1,27 @@
+# Example configuration for AC VRF Controller
+# Add this to your configuration.yaml
+
+# Option 1: With username and password
+climate:
+  - platform: ac_vrf
+    host: 192.168.1.251        # Required: Your AC controller IP
+    username: admin             # Optional: HTTP Basic Auth username
+    password: your_password     # Optional: HTTP Basic Auth password
+
+# Option 2: With username but empty password
+#climate:
+#  - platform: ac_vrf
+#    host: 192.168.1.251
+#    username: admin
+#    password: ""               # Empty password is supported
+
+# Option 3: No authentication
+#climate:
+#  - platform: ac_vrf
+#    host: 192.168.1.251
+
+# Optional: Enable debug logging
+logger:
+  default: info
+  logs:
+    custom_components.ac_vrf: debug
