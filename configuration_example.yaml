@@ -22,6 +22,6 @@ climate:
 
 # Optional: Enable debug logging
 logger:
-  default: info
+  default: warning
   logs:
     custom_components.ac_vrf: debug

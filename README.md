@@ -1,180 +1,141 @@
 # AC VRF Controller Integration for Home Assistant
 
-This custom integration allows you to control your AC VRF units through Home Assistant.
+A custom integration that controls the indoor units of a TIS AC VRF controller from Home Assistant. Every indoor unit connected to the controller shows up as a `climate` entity.
 
 ## Installation
 
-1. Copy the `ac_vrf` folder to your Home Assistant's `custom_components` directory:
-   ```
-   /config/custom_components/ac_vrf/
-   ```
+**HACS:** add `https://github.com/linusali/hass-tis-vrf-ac` as a custom repository (category *Integration*), install **AC VRF Controller**, then restart Home Assistant.
 
-2. Restart Home Assistant
+**Manual:** copy `custom_components/ac_vrf/` into your Home Assistant `config/custom_components/` directory and restart. See [INSTALLATION.md](INSTALLATION.md) for details.
 
 ## Configuration
 
-Add the following to your `configuration.yaml`:
+The integration is configured in `configuration.yaml`:
 
 ```yaml
 climate:
   - platform: ac_vrf
-    host: 192.168.1.251          # Required: Your AC controller IP address
-    username: admin               # Optional: HTTP Basic Auth username
-    password: your_password       # Optional: HTTP Basic Auth password
+    host: 192.168.1.251          # Required: controller IP address
+    username: admin              # Optional: HTTP Basic Auth username
+    password: your_password      # Optional: HTTP Basic Auth password
 ```
 
-**Configuration Options:**
-- `host` (required): IP address of your AC VRF controller
-- `username` (optional): Username for HTTP Basic Authentication
-- `password` (optional): Password for HTTP Basic Authentication (can be empty string)
+| Option | Required | Description |
+|---|---|---|
+| `host` | yes | IP address (or `ip:port`) of the VRF controller |
+| `username` | no | HTTP Basic Auth username. Leave it out if the controller has no authentication |
+| `password` | no | HTTP Basic Auth password. May be an empty string (`password: ""`) |
 
-**Configuration Examples:**
+Restart Home Assistant after changing the configuration. A full restart is needed; reloading YAML is not enough.
 
-With username and password:
-```yaml
-climate:
-  - platform: ac_vrf
-    host: 192.168.1.251
-    username: admin
-    password: your_password
-```
-
-With username but empty password:
-```yaml
-climate:
-  - platform: ac_vrf
-    host: 192.168.1.251
-    username: admin
-    password: ""
-```
-
-Without authentication:
-```yaml
-climate:
-  - platform: ac_vrf
-    host: 192.168.1.251
-```
-
-After adding the configuration, restart Home Assistant. The integration will automatically discover all AC units connected to your VRF controller.
+Give the controller a fixed IP address (e.g. a DHCP reservation). Entities are identified by the controller's address, so if it changes, Home Assistant creates a new set of entities.
 
 ## Features
 
-- **Automatic Unit Discovery**: All AC units are automatically discovered from the controller
-- **Real-time Status**: Updates every 2 seconds to reflect current state
-- **Full Control**:
+- **Automatic discovery:** one climate entity per indoor unit, named as configured on the controller (for example, a unit named "Living" becomes `climate.living`).
+- **Status polling:** the controller is polled once every 3 seconds for all units together.
+- **Control:**
   - Turn on/off
-  - Set temperature (16-30°C)
-  - Change HVAC mode (Cool, Heat, Dry, Fan Only)
-  - Adjust fan speed (Low, Medium, High, Auto)
-- **Current Temperature**: Displays the current room temperature from each unit
+  - Set target temperature (16–30 °C, 1 °C steps)
+  - HVAC mode: Cool, Heat, Dry, Fan Only
+  - Fan speed: Low, Medium, High, Auto
+- **Current room temperature** reported by each unit.
+- **Availability:** a unit is shown as *unavailable* when the controller can't be reached or doesn't report that unit, rather than showing stale values. Entities recover on their own when the controller comes back.
+- If the controller is unreachable when Home Assistant starts, setup is retried automatically.
 
-## Discovered Entities
+Setting a temperature or fan speed on a unit that is off stores the setting without turning the unit on.
 
-Based on your configuration, the following climate entities will be created:
-- `climate.maidsroom`
-- `climate.majlis`
-- `climate.living`
-- `climate.kitchen`
-- `climate.m_bedroom`
-- `climate.ahzab`
-- `climate.ehsan`
-- `climate.office`
+## API mapping
 
-## API Mapping
+The controller exposes a CGI API at `http://<host>/cgi-bin/api.html`:
 
-The integration maps Home Assistant's climate entity features to your AC controller's API:
+- Status: `?f=17&p=<page>` (pages 0 and 1 are read)
+- Command: `?f=18&on=..&mode=..&tempSet=..&fan=..&FlowDirection1=..&FlowDirection2=..&idx=<unit>`
 
-### HVAC Modes
-- **Cool**: `mode=1`
-- **Heat**: `mode=8`
-- **Dry**: `mode=2`
-- **Fan Only** (Fresh Air): `mode=4`
-- **Off**: `on=0`
+The controller replies with HTTP/0.9-style responses (no status line or headers), which standard HTTP clients reject, so the integration sends its requests over a plain TCP socket.
 
-### Fan Modes
-- **Low**: `fan=4`
-- **Medium**: `fan=2`
-- **High**: `fan=1`
-- **Auto**: `fan=8`
+### HVAC modes
 
-## Troubleshooting
+| Home Assistant | `mode` |
+|---|---|
+| Cool | `1` |
+| Dry | `2` |
+| Fan Only (Fresh Air) | `4` |
+| Heat | `8` |
+| Off | `on=0` |
 
-### Units not appearing
-- Check that your AC controller is accessible at the configured IP address
-- Verify the controller is responding to status requests
-- Check Home Assistant logs for any error messages
+### Fan modes
 
-### Commands not working
-- Ensure your network allows communication with the AC controller
-- Check that the controller is not locked or in a restricted mode
-- Review Home Assistant logs for timeout or connection errors
+| Home Assistant | `fan` |
+|---|---|
+| High | `1` |
+| Medium | `2` |
+| Low | `4` |
+| Auto | `8` |
 
-### Viewing Logs
-Enable debug logging by adding to `configuration.yaml`:
+## Example automations
 
-```yaml
-logger:
-  default: info
-  logs:
-    custom_components.ac_vrf: debug
-```
+### Turn on the AC when arriving home
 
-## Example Automations
-
-### Turn on AC when arriving home
 ```yaml
 automation:
   - alias: "AC on when home"
-    trigger:
-      - platform: state
+    triggers:
+      - trigger: state
         entity_id: person.your_name
         to: "home"
-    action:
-      - service: climate.set_hvac_mode
+    actions:
+      - action: climate.set_hvac_mode
         target:
           entity_id: climate.living
         data:
           hvac_mode: cool
-      - service: climate.set_temperature
+      - action: climate.set_temperature
         target:
           entity_id: climate.living
         data:
           temperature: 24
 ```
 
-### Energy-saving night mode
+### Night mode for the bedrooms
+
 ```yaml
 automation:
   - alias: "AC night mode"
-    trigger:
-      - platform: time
+    triggers:
+      - trigger: time
         at: "22:00:00"
-    action:
-      - service: climate.set_temperature
+    actions:
+      - action: climate.set_temperature
         target:
-          entity_id: 
-            - climate.m_bedroom
-            - climate.ahzab
-            - climate.ehsan
+          entity_id:
+            - climate.bedroom_1
+            - climate.bedroom_2
         data:
           temperature: 26
-      - service: climate.set_fan_mode
+      - action: climate.set_fan_mode
         target:
-          entity_id: 
-            - climate.m_bedroom
-            - climate.ahzab
-            - climate.ehsan
+          entity_id:
+            - climate.bedroom_1
+            - climate.bedroom_2
         data:
           fan_mode: "low"
 ```
 
-## Support
+## Troubleshooting
 
-For issues or questions, please check the Home Assistant logs and verify your controller's API is functioning correctly.
+See [TROUBLESHOOTING.md](TROUBLESHOOTING.md). To see what the integration is doing, enable debug logging:
 
-## Technical Details
+```yaml
+logger:
+  default: warning
+  logs:
+    custom_components.ac_vrf: debug
+```
 
-- **Polling Interval**: 3 seconds
-- **Timeout**: 10 seconds for API calls
-- **Dependencies**: None (uses built-in aiohttp)
-- **Integration Type**: Local Polling
+## Technical details
+
+- **Integration type:** local polling (`configuration.yaml` only, no UI config flow)
+- **Polling interval:** 3 seconds, one status poll shared by all units
+- **Socket timeout:** 10 seconds per request
+- **Dependencies:** none beyond Home Assistant itself

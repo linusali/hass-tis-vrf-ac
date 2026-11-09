@@ -4,9 +4,9 @@
 
 - Files are in `/config/custom_components/ac_vrf/`
 - `configuration.yaml` has correct indentation (spaces, not tabs)
-- Home Assistant was fully restarted (not just config reload)
-- Controller IP is correct and reachable from the HA host
-- Username/password are correct (if authentication is required)
+- Home Assistant was fully restarted (not just a configuration reload)
+- Controller IP is correct and reachable from the Home Assistant host
+- Username/password are correct (if the controller requires authentication)
 
 ## Step 1: Enable debug logging
 
@@ -19,58 +19,58 @@ logger:
     custom_components.ac_vrf: debug
 ```
 
-Restart and check **Settings → System → Logs** for messages containing `ac_vrf`.
+Restart and check **Settings → System → Logs** for messages containing `ac_vrf`. With debug logging enabled you'll see each status response and every command sent to the controller.
 
-## Step 2: Test API connectivity
+## Step 2: Test the controller with the test script
 
-Run the included test script from the HA host or any machine on the same network:
+`test_ac_vrf_connection.py` talks to the controller the same way the integration does (raw socket, HTTP/0.9-tolerant). It needs only Python 3, no extra packages. Run it from the Home Assistant host or any machine on the same network:
 
-1. Edit `test_ac_vrf_connection.py` with your settings:
-   ```python
-   HOST = "192.168.1.251"
-   USERNAME = "admin"   # or None
-   PASSWORD = ""        # or None
-   ```
+```bash
+# No authentication
+python3 test_ac_vrf_connection.py 192.168.1.251
 
-2. Run:
-   ```bash
-   python3 test_ac_vrf_connection.py
-   ```
+# With authentication (empty password is fine)
+python3 test_ac_vrf_connection.py 192.168.1.251 --username admin --password ""
+```
 
-The output will show all discovered units or a clear error message.
+It lists every unit found on each status page, or prints the raw response if something is wrong.
 
 ## Step 3: Test raw network access
 
-From the HA host, verify the controller is reachable:
+From the Home Assistant host:
 
 ```bash
-# Test ping
 ping 192.168.1.251
 
-# Test HTTP access (note: controller uses HTTP/0.9 — use --http0.9 flag)
+# The controller replies with HTTP/0.9, so curl needs --http0.9
 curl --http0.9 "http://192.168.1.251/cgi-bin/api.html?f=17&p=0"
 
 # With authentication
 curl --http0.9 -u admin: "http://192.168.1.251/cgi-bin/api.html?f=17&p=0"
 ```
 
-If `curl` returns `Received HTTP/0.9 when not allowed` without the flag, that confirms the controller uses the older HTTP/0.9 protocol — the integration handles this automatically.
+If `curl` without the flag says `Received HTTP/0.9 when not allowed`, that confirms the controller uses HTTP/0.9; the integration handles this automatically.
 
-If these commands fail entirely, the issue is network/firewall, not the integration.
+If these commands fail entirely, the problem is the network or firewall, not the integration.
 
-## Common errors
+## Common log messages
 
-| Error | Cause | Fix |
+| Message | Cause | Fix |
 |---|---|---|
-| `Platform not found` | Files not installed correctly | Verify Step 1 of INSTALLATION.md |
-| `Authentication failed` / `HTTP 401` | Wrong credentials | Check username/password in config |
-| `Timeout` / `Connection refused` | Controller unreachable | Check IP address and network |
-| `No units discovered` | API not returning data | Run test script to inspect raw response |
-| `YAML error` on startup | Config formatting issue | Use **Developer Tools → YAML → Check Configuration** |
+| `Integration 'ac_vrf' not found` / `Platform not found` | Files not installed correctly | Check Step 1 of [INSTALLATION.md](INSTALLATION.md) |
+| `No AC units could be read from controller ... Retrying` | Controller unreachable at startup | Home Assistant keeps retrying; check IP, power and network |
+| `Failed to read status page N` | One status page timed out or returned bad data | Units on that page show as unavailable until it recovers; logged once per outage |
+| `Error fetching AC VRF ... data` | No units could be read at all | All entities become unavailable; check the controller and network |
+| `Failed to send command to AC unit` | Command couldn't reach the controller | Check the controller is reachable |
+| `invalid JSON` / `controller returned error code` | Unexpected response | Run the test script and inspect the raw response; check credentials |
+| YAML error on startup | Config formatting issue | Use **Developer Tools → YAML → Check Configuration** |
 
-## Entities appear as "Unavailable"
+## Entities show as "Unavailable"
 
-This means the integration loaded but can't reach the controller at runtime. Check:
-- Controller is powered on and connected to the network
-- No firewall rules blocking traffic from the HA host
-- Credentials haven't changed
+The integration loaded but couldn't read those units on the last poll. Check:
+
+- The controller is powered on and connected to the network
+- No firewall rules block traffic from the Home Assistant host
+- The credentials haven't changed
+
+If only some units are unavailable, the controller is failing to return one of its status pages; the debug log shows which one. Entities recover automatically once the controller responds again.

@@ -1,10 +1,11 @@
 {
   "domain": "ac_vrf",
   "name": "AC VRF Controller",
-  "version": "1.0.1",
-  "documentation": "https://github.com/linusali/hass-tis-vrf-ac",
-  "requirements": [],
   "codeowners": ["@linusali"],
+  "config_flow": false,
+  "documentation": "https://github.com/linusali/hass-tis-vrf-ac",
   "iot_class": "local_polling",
-  "config_flow": false
+  "issue_tracker": "https://github.com/linusali/hass-tis-vrf-ac/issues",
+  "requirements": [],
+  "version": "1.1.0"
 }
