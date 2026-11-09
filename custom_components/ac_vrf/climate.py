@@ -5,14 +5,18 @@ import asyncio
 import base64
 import json
 import logging
+import math
 import socket
+import time
 import urllib.parse
+from collections.abc import Callable
 from datetime import timedelta
 from typing import Any
 
 import voluptuous as vol
 
 from homeassistant.components.climate import (
+    ATTR_HVAC_MODE,
     PLATFORM_SCHEMA as CLIMATE_PLATFORM_SCHEMA,
     ClimateEntity,
     ClimateEntityFeature,
@@ -69,8 +73,13 @@ STATUS_PAGES = (0, 1)
 # One poll of the controller per interval, shared by all units.
 UPDATE_INTERVAL = timedelta(seconds=3)
 
-# Give the controller a moment to apply a command before re-reading status.
-COMMAND_SETTLE_DELAY = 0.5
+# Pause after each command before the next one is sent to the controller.
+COMMAND_GAP_SECONDS = 0.3
+
+# After a command, the controller's status can lag behind for a few seconds.
+# During this window a poll that doesn't match what was commanded is treated as
+# stale and doesn't overwrite the entity's state.
+COMMAND_GRACE_SECONDS = 10
 
 SOCKET_TIMEOUT = 10
 
@@ -137,6 +146,42 @@ class ACVRFCoordinator(DataUpdateCoordinator[dict[Any, dict[str, Any]]]):
         # Pages that failed on the previous poll, so a persistent failure is
         # logged once rather than on every poll.
         self._failed_pages: set[int] = set()
+        # The controller gets one command at a time.
+        self._command_lock = asyncio.Lock()
+
+    async def async_send_command(self, idx: Any, build_params: Callable[[], dict[str, Any]]) -> None:
+        """Send a command for one unit.
+
+        `build_params` is called once the command lock is held, so the command
+        carries the unit's latest desired state even if other commands for the
+        same unit were queued ahead of it.
+        """
+        async with self._command_lock:
+            params = build_params()
+            url = (
+                f"http://{self.host}/cgi-bin/api.html?"
+                f"f=18&on={params['on']}&mode={params['mode']}"
+                f"&tempSet={params['tempSet']}&fan={params['fan']}"
+                f"&FlowDirection1={params['FlowDirection1']}"
+                f"&FlowDirection2={params['FlowDirection2']}"
+                f"&idx={idx}"
+            )
+            try:
+                text = await self.hass.async_add_executor_job(self._fetch_raw, url)
+            finally:
+                await asyncio.sleep(COMMAND_GAP_SECONDS)
+
+        _LOGGER.debug("AC VRF: unit %s <- %s. Response: %s", idx, params, text[:100])
+        try:
+            result = self._parse_status(text)
+        except ValueError:
+            return  # no JSON body; nothing to check
+        if result.get("err", 0) != 0:
+            _LOGGER.warning(
+                "AC VRF: Controller returned error code %r for command to unit %s",
+                result.get("err"),
+                idx,
+            )
 
     def _fetch_raw(self, url: str) -> str:
         """Fetch data using a raw (blocking) socket.
@@ -299,13 +344,23 @@ class ACVRFClimate(CoordinatorEntity[ACVRFCoordinator], ClimateEntity):
         # entity registry entries (entity IDs, names, customizations).
         self._attr_unique_id = f"ac_vrf_{host}_{idx}"
 
-        # Raw controller values, sent back unchanged in commands.
-        self._current_mode = None
-        self._current_fan = None
-        self._current_flow_dir1 = 0
-        self._current_flow_dir2 = 0
+        # Desired state: what the unit should be doing. Every command sends
+        # the full state, built from these, never from the last poll. That
+        # way two commands in a row (e.g. Versatile Thermostat sending
+        # set_hvac_mode then set_temperature) can't undo each other while the
+        # controller's status is still catching up. Raw controller values are
+        # kept so unknown modes/fan codes are sent back unchanged.
+        self._on: int | None = None
+        self._mode: Any = None
+        self._temp: int | None = None
+        self._fan: Any = None
+        self._flow1: Any = 0
+        self._flow2: Any = 0
+        # Until this time (monotonic), polls that don't match the desired
+        # state are considered stale.
+        self._grace_until = 0.0
 
-        self._update_from_unit()
+        self._sync_from_unit(force=True)
 
     @property
     def available(self) -> bool:
@@ -315,118 +370,150 @@ class ACVRFClimate(CoordinatorEntity[ACVRFCoordinator], ClimateEntity):
     @callback
     def _handle_coordinator_update(self) -> None:
         """Handle updated data from the coordinator."""
-        self._update_from_unit()
+        self._sync_from_unit()
         super()._handle_coordinator_update()
 
-    def _update_from_unit(self) -> None:
+    @staticmethod
+    def _read_unit(unit: dict[str, Any]) -> dict[str, Any] | None:
+        """Extract the fields we use from a unit dict, or None if malformed."""
+        try:
+            return {
+                "name": unit["nm"],
+                "on": 1 if unit["on"] == 1 else 0,
+                "mode": unit["mode"],
+                "temp": int(float(unit["tempSet"])),
+                "temp_in": float(unit["tempIn"]),
+                "fan": unit["fan"],
+                "flow1": unit.get("FlowDirection1", 0),
+                "flow2": unit.get("FlowDirection2", 0),
+            }
+        except (KeyError, TypeError, ValueError) as err:
+            _LOGGER.debug("AC VRF: Unexpected status data for unit %s (%s): %s", unit.get("idx"), err, unit)
+            return None
+
+    def _matches(self, status: dict[str, Any]) -> bool:
+        """Return True if the controller reports the desired state."""
+        return (
+            status["on"] == self._on
+            and status["mode"] == self._mode
+            and status["temp"] == self._temp
+            and status["fan"] == self._fan
+        )
+
+    def _sync_from_unit(self, force: bool = False) -> None:
         """Update state from this unit's entry in the coordinator data."""
         unit = self.coordinator.data.get(self._idx)
-        if unit is None:
+        status = self._read_unit(unit) if unit is not None else None
+        if status is None:
             return
 
-        try:
-            name = unit["nm"]
-            is_on = unit["on"] == 1
-            mode = unit["mode"]
-            temp_set = float(unit["tempSet"])
-            temp_in = float(unit["tempIn"])
-            fan = unit["fan"]
-        except (KeyError, TypeError, ValueError) as err:
-            _LOGGER.debug(
-                "AC VRF: Unexpected status data for unit %s (%s): %s", self._idx, err, unit
-            )
-            return
+        self._attr_name = status["name"]
+        self._attr_current_temperature = status["temp_in"]
 
-        self._attr_name = name
+        in_grace = time.monotonic() < self._grace_until
+        if in_grace and not force:
+            if not self._matches(status):
+                # The controller hasn't caught up with the last command yet;
+                # keep showing (and sending) the commanded state.
+                return
+            self._grace_until = 0.0
+
+        self._on = status["on"]
+        self._mode = status["mode"]
+        self._temp = status["temp"]
+        self._fan = status["fan"]
+        self._flow1 = status["flow1"]
+        self._flow2 = status["flow2"]
+        self._update_attrs()
+
+    def _update_attrs(self) -> None:
+        """Derive the Home Assistant attributes from the desired state."""
         self._attr_hvac_mode = (
-            MODE_TO_HVAC.get(mode, HVACMode.COOL) if is_on else HVACMode.OFF
+            MODE_TO_HVAC.get(self._mode, HVACMode.COOL) if self._on else HVACMode.OFF
         )
-        self._attr_target_temperature = temp_set
-        self._attr_current_temperature = temp_in
-        self._attr_fan_mode = FAN_MODE_MAP.get(fan, "auto")
+        self._attr_target_temperature = float(self._temp) if self._temp is not None else None
+        self._attr_fan_mode = FAN_MODE_MAP.get(self._fan, "auto")
 
-        self._current_mode = mode
-        self._current_fan = fan
-        self._current_flow_dir1 = unit.get("FlowDirection1", 0)
-        self._current_flow_dir2 = unit.get("FlowDirection2", 0)
+    async def _push(self) -> None:
+        """Send the desired state to the controller and show it right away."""
+        if self._on is None or self._temp is None:
+            raise HomeAssistantError(f"State of AC unit {self.name} is not known yet")
 
-    async def _send_command(
-        self,
-        on: int,
-        mode: int | None = None,
-        temp_set: float | None = None,
-        fan: int | None = None,
-    ) -> None:
-        """Send a command to the AC unit, then refresh status."""
-        # The controller sets every field at once, so unspecified fields are
-        # sent with their current values.
-        if mode is None:
-            mode = self._current_mode
-        if temp_set is None:
-            temp_set = self._attr_target_temperature
-        if fan is None:
-            fan = self._current_fan
-
-        url = (
-            f"http://{self._host}/cgi-bin/api.html?"
-            f"f=18&on={on}&mode={mode}&tempSet={int(temp_set)}&fan={fan}"
-            f"&FlowDirection1={self._current_flow_dir1}"
-            f"&FlowDirection2={self._current_flow_dir2}"
-            f"&idx={self._idx}"
-        )
+        self._grace_until = time.monotonic() + COMMAND_GRACE_SECONDS
+        self._update_attrs()
+        self.async_write_ha_state()
 
         try:
-            text = await self.hass.async_add_executor_job(
-                self.coordinator._fetch_raw, url
+            await self.coordinator.async_send_command(
+                self._idx,
+                lambda: {
+                    "on": self._on,
+                    "mode": self._mode,
+                    "tempSet": self._temp,
+                    "fan": self._fan,
+                    "FlowDirection1": self._flow1,
+                    "FlowDirection2": self._flow2,
+                },
             )
         except OSError as err:
+            # Nothing reached the controller: go back to its last known state.
+            self._grace_until = 0.0
+            self._sync_from_unit(force=True)
+            self.async_write_ha_state()
             raise HomeAssistantError(
                 f"Failed to send command to AC unit {self.name}: {err}"
             ) from err
 
-        _LOGGER.debug(
-            "AC VRF: Command sent to unit %s: on=%s, mode=%s, temp=%s, fan=%s. Response: %s",
-            self._idx,
-            on,
-            mode,
-            temp_set,
-            fan,
-            text[:100],
-        )
+        await self.coordinator.async_request_refresh()
 
-        await asyncio.sleep(COMMAND_SETTLE_DELAY)
-        await self.coordinator.async_refresh()
+    def _set_hvac_mode(self, hvac_mode: HVACMode) -> None:
+        if hvac_mode == HVACMode.OFF:
+            self._on = 0
+        else:
+            self._on = 1
+            self._mode = HVAC_TO_MODE.get(hvac_mode, 1)
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         """Set new target hvac mode."""
-        if hvac_mode == HVACMode.OFF:
-            await self._send_command(on=0)
-        else:
-            mode = HVAC_TO_MODE.get(hvac_mode, 1)
-            await self._send_command(on=1, mode=mode)
+        self._set_hvac_mode(hvac_mode)
+        await self._push()
 
     async def async_set_temperature(self, **kwargs: Any) -> None:
-        """Set new target temperature.
+        """Set new target temperature (and optionally the hvac mode).
 
-        The unit's on/off state is preserved: setting a temperature on a unit
-        that is off stores the setpoint without turning it on.
+        Without an hvac_mode the unit's on/off state is preserved: setting a
+        temperature on a unit that is off stores the setpoint without turning
+        it on.
         """
         temperature = kwargs.get(ATTR_TEMPERATURE)
+        hvac_mode = kwargs.get(ATTR_HVAC_MODE)
+        if temperature is None and hvac_mode is None:
+            return
+        if hvac_mode is not None:
+            self._set_hvac_mode(hvac_mode)
         if temperature is not None:
-            is_on = 1 if self._attr_hvac_mode != HVACMode.OFF else 0
-            await self._send_command(on=is_on, temp_set=temperature)
+            # The controller takes whole degrees; round (Versatile Thermostat
+            # sends fractional setpoints) and keep within the unit's range.
+            # (half-up, so 24.5 -> 25; Python's round() would give 24).
+            self._temp = max(
+                self._attr_min_temp,
+                min(self._attr_max_temp, math.floor(float(temperature) + 0.5)),
+            )
+        await self._push()
 
     async def async_set_fan_mode(self, fan_mode: str) -> None:
         """Set new target fan mode."""
         fan = FAN_MODE_REVERSE.get(fan_mode)
         if fan is not None:
-            is_on = 1 if self._attr_hvac_mode != HVACMode.OFF else 0
-            await self._send_command(on=is_on, fan=fan)
+            self._fan = fan
+            await self._push()
 
     async def async_turn_on(self) -> None:
         """Turn the entity on."""
-        await self._send_command(on=1)
+        self._on = 1
+        await self._push()
 
     async def async_turn_off(self) -> None:
         """Turn the entity off."""
-        await self._send_command(on=0)
+        self._on = 0
+        await self._push()

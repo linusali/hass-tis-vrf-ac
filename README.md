@@ -45,6 +45,12 @@ Give the controller a fixed IP address (e.g. a DHCP reservation). Entities are i
 
 Setting a temperature or fan speed on a unit that is off stores the setting without turning the unit on.
 
+### Command handling
+
+Each command sends the unit's full state (on/off, mode, setpoint, fan). The integration builds every command from the state you last asked for, not from the last poll, and sends them to the controller one at a time. The controller's status can take a few seconds to catch up. During that time (up to 10 s after a command) a poll that doesn't match yet is treated as out of date, so the entity doesn't flip back to its old state. This makes the entities safe to drive from [Versatile Thermostat](https://github.com/jmcollin78/versatile_thermostat), which sends several commands in a row (e.g. set the mode, then the temperature).
+
+Setpoints are whole degrees: fractional values are rounded half-up (24.5 → 25) and limited to 16–30 °C.
+
 ## API mapping
 
 The controller exposes a CGI API at `http://<host>/cgi-bin/api.html`:
