@@ -1,3 +1,5 @@
+<img src="custom_components/ac_vrf/brand/icon.png" alt="" width="96" align="right">
+
 # AC VRF Controller Integration for Home Assistant
 
 A custom integration that controls the indoor units of a TIS AC VRF controller from Home Assistant. Every indoor unit connected to the controller shows up as a `climate` entity.
